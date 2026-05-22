@@ -3,13 +3,19 @@ Ollama LLM Interface for LSTM + LLM Ablation Study
 Handles communication with Ollama (Gemma3) running on localhost
 """
 
+# Optional HF imports (used when using Hugging Face SLM models)
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except Exception:
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+
 import requests
 import numpy as np
 import torch
 import time
 from typing import Dict, List, Tuple, Optional
 import json
-
 
 class OllamaInterface:
     """Interface to communicate with Ollama LLM (Gemma3)"""
@@ -261,7 +267,7 @@ def get_llm_interface(
     
     if not use_ollama:
         return MockOllamaInterface(embedding_dim=256)
-    
+
     try:
         interface = OllamaInterface(
             model_name=model_name,
@@ -279,3 +285,123 @@ def get_llm_interface(
     except Exception as e:
         print(f"Failed to create Ollama interface: {e}")
         return MockOllamaInterface(embedding_dim=256)
+
+
+class HFSLMInterface:
+    """Hugging Face SLM Interface for direct model usage (e.g. Orthrus/Qwen variants).
+
+    Produces a fixed-size strategy embedding (256-dim) by running the causal LM
+    and pooling its final hidden states, then projecting to 256 dims.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        embedding_dim: int = 256,
+        device: Optional[str] = None,
+        trust_remote_code: bool = True,
+        **from_pretrained_kwargs,
+    ):
+        if AutoModelForCausalLM is None or AutoTokenizer is None:
+            raise RuntimeError("transformers not available in this environment")
+
+        self.model_path = model_path
+        self.embedding_dim = embedding_dim
+
+        # Device selection
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+
+        # Load tokenizer and model (best-effort for Kaggle + HF)
+        # Use conservative kwargs when GPU not present
+        hf_kwargs = dict(from_pretrained_kwargs)
+        if self.device == "cpu":
+            hf_kwargs.setdefault("torch_dtype", torch.float32)
+            hf_kwargs.setdefault("low_cpu_mem_usage", True)
+        else:
+            # allow user-provided heavy options (device_map, bfloat16)
+            pass
+
+        print(f"Loading HF model {model_path} on {self.device} (this may take a while)")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            **hf_kwargs,
+        )
+
+        # Move model to device
+        try:
+            if self.device == "cuda":
+                self.model.to("cuda")
+            else:
+                self.model.to("cpu")
+        except Exception:
+            pass
+
+        self.model.eval()
+
+        # Projection layer from HF hidden size -> embedding_dim
+        hidden_size = getattr(self.model.config, "hidden_size", None) or getattr(self.model.config, "n_embd", None)
+        if hidden_size is None:
+            # fallback
+            hidden_size = 1024
+
+        self._proj = torch.nn.Linear(hidden_size, self.embedding_dim)
+        self._proj.to(self.device)
+
+        self.is_connected = True
+
+    def _prepare_input_ids(self, prompt: str):
+        # Prefer chat template if tokenizer supports it
+        try:
+            ids = self.tokenizer.apply_chat_template(
+                [{"role": "system", "content": ""}, {"role": "user", "content": prompt}],
+                tokenize=True,
+                enable_thinking=False,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).input_ids
+        except Exception:
+            ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+
+        return ids.to(self.device)
+
+    def generate_strategy_embedding(self, state: np.ndarray, task_description: str = "HalfCheetah locomotion", history: Optional[List[str]] = None) -> torch.Tensor:
+        prompt = self._build_prompt(self._format_state_for_prompt(state), task_description, history)
+        input_ids = self._prepare_input_ids(prompt)
+
+        # Run model to get hidden states
+        with torch.no_grad():
+            outputs = self.model(input_ids, output_hidden_states=True, return_dict=True)
+
+        # Prefer last hidden state
+        hidden_states = None
+        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+            hidden_states = outputs.hidden_states[-1]  # (1, seq_len, hidden)
+        elif hasattr(outputs, "last_hidden_state"):
+            hidden_states = outputs.last_hidden_state
+
+        if hidden_states is None:
+            # fallback to zero vector
+            h = torch.zeros(self._proj.in_features, device=self.device)
+        else:
+            # Mean pool over sequence dim
+            h = hidden_states.mean(dim=1).squeeze(0)  # (hidden,)
+
+        emb = self._proj(h)
+        emb = emb.detach().cpu().float()
+        # Normalize
+        emb = emb / (emb.norm() + 1e-8)
+        return emb
+
+    def batch_generate_embeddings(self, states: np.ndarray, task_description: str = "HalfCheetah locomotion") -> torch.Tensor:
+        embeddings = []
+        for seq in states:
+            seq_embs = []
+            for state in seq:
+                seq_embs.append(self.generate_strategy_embedding(state, task_description))
+            embeddings.append(torch.stack(seq_embs))
+        return torch.stack(embeddings)
