@@ -212,8 +212,21 @@ class PPOTrainer:
                 
                 # Policy forward pass
                 if self.use_llm and self.llm_interface:
-                    # TODO: Get LLM embeddings for batch
-                    dist, _, _ = self.model(batch_states, None)
+                    # Generate LLM embeddings for batch
+                    batch_size = batch_states.shape[0]
+                    seq_len = batch_states.shape[1]
+                    
+                    llm_embeddings = []
+                    for i in range(batch_size):
+                        # Get first state in sequence for this batch item
+                        state_np = batch_states[i, 0].cpu().numpy()
+                        llm_z = self.llm_interface.generate_strategy_embedding(state_np)
+                        # Repeat embedding across sequence length
+                        llm_z_seq = llm_z.unsqueeze(0).repeat(seq_len, 1)  # (seq_len, 256)
+                        llm_embeddings.append(llm_z_seq)
+                    
+                    llm_batch = torch.stack(llm_embeddings).to(self.device)  # (batch, seq_len, 256)
+                    dist, _, _ = self.model(batch_states, llm_batch)
                 else:
                     dist, _, _ = self.model(batch_states)
                 
