@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+  # Ollama service with pre-loaded model
+  ollama:
+    image: ollama/ollama:latest
+    container_name: lstm_ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - lstm_network
+
+  # Main LSTM + LLM pipeline
+  lstm_llm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lstm_llm_app
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=ollama:11434
+      - KMP_DUPLICATE_LIB_OK=TRUE
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./results:/app/results
+      - ./logs:/app/logs
+    ports:
+      - "8000:8000"
+    networks:
+      - lstm_network
+    stdin_open: true
+    tty: true
+
+volumes:
+  ollama_models:
+    driver: local
+
+networks:
+  lstm_network:
+    driver: bridge
